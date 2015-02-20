@@ -10,8 +10,9 @@ import (
 )
 
 type Token struct {
-	item item
-	val  string
+	item  item
+	val   string
+	scope int
 }
 
 type item int
@@ -89,16 +90,18 @@ type stateFn func(*lexer) stateFn
 
 type lexer struct {
 	state stateFn
-	input *bytes.Buffer
-	cur   *bytes.Buffer
+	in    *bytes.Buffer
+	input []byte
+	start int
+	pos   int
 	width int
+	scope int
 	items chan Token
 }
 
 func NewLexer() *lexer {
 	l := &lexer{
-		input: &bytes.Buffer{},
-		cur:   &bytes.Buffer{},
+		in:    &bytes.Buffer{},
 		items: make(chan Token),
 	}
 	return l
@@ -111,8 +114,8 @@ func (l *lexer) run() {
 }
 
 func (l *lexer) emit(i item) {
-	l.items <- Token{i, l.cur.String()}
-	l.cur.Truncate(0)
+	l.items <- Token{i, l.cur(), l.scope}
+	l.ignore()
 }
 
 func (l *lexer) errorf(format string, args ...interface{}) stateFn {
@@ -125,19 +128,24 @@ func (l *lexer) Write(b []byte) (int, error) {
 }
 
 func (l *lexer) next() rune {
-	r, w, err := l.input.ReadRune()
-	if err == io.EOF {
-		l.width = 0
-		return eof
+	r, w := utf8.DecodeRune(l.input[l.pos:])
+	if r == utf8.RuneError {
+		if w == 0 && l.in.Len() == 0 {
+			return eof
+		}
+		if _, err := io.ReadFull(l.in, l.input); err != nil && err != io.ErrUnexpectedEOF {
+			l.errorf(err)
+			return eof
+		}
+		return l.next()
 	}
-	if r != utf8.RuneError {
-		l.width = w
-	}
+	l.pos += w
+	l.width = w
 	return r
 }
 
 func (l *lexer) backup() {
-	l.input.UnreadRune()
+	l.pos -= l.width
 }
 
 func (l *lexer) peek() rune {
@@ -146,18 +154,13 @@ func (l *lexer) peek() rune {
 	return r
 }
 
-// lookahead sneaks unread bytes out of the buffer
-func (l *lexer) lookahead(n int) []byte {
-	r := make([]byte, n)
-	copy(r, l.input.Bytes()[:n])
-	return r
+func (l *lexer) ignore() {
+	l.start = l.pos
+	l.width = 0
 }
 
-func (l *lexer) ignore() {
-	l.cur.Reset()
-}
-func (l *lexer) keep(r rune) {
-	l.cur.WriteRune(r)
+func (l *lexer) cur() string {
+	return string(l.input[l.start:l.pos])
 }
 
 func (l *lexer) accept(s string) bool {
@@ -174,17 +177,85 @@ func (l *lexer) acceptRun(s string) {
 	l.backup()
 }
 
-func (l *lexer) acceptWhitespace() {
+func (l *lexer) discardWhitespace() {
 	for r := l.next(); unicode.IsSpace(r); r = l.next() {
+	}
+	l.backup()
+	l.ignore()
+}
+
+// This consumes a "Name" as defined by the Lua spec: http://www.lua.org/manual/5.3/manual.html#3.1
+func (l *lexer) consumeName() {
+	for r := l.next(); unicode.IsLetter(r) || unicode.IsDigit || r == '_'; r = l.next() {
 	}
 	l.backup()
 }
 
-func (l *lexer) consumeIdentifier() {
-	for r := l.next(); unicode.IsLetter(r) || unicode.IsDigit || r == '_'; r = l.next() {
-		l.keep(r)
+func lexStmt(l *lexer) stateFn {
+	l.discardWhitespace()
+	switch l.peek() {
+	case ';':
+		l.next()
+		l.emit(itemSemi)
+		return lexStmt
+	case '-':
+		return lexComment
+	case ':':
+		l.next()
+		if l.peek() != ':' {
+			l.errorf("expected ':', got %q", l.peek())
+			return nil
+		}
+		l.next()
+		return lexLabel
 	}
-	l.backup()
+	l.consumeName()
+	switch l.cur() {
+	case "break":
+		l.emit(itemBreak)
+		return lexStmt
+	case "goto":
+		l.ignore()
+		l.discardWhitespace()
+		l.consumeName()
+		l.emit(itemGoto)
+		return lexStmt
+	case "do":
+		l.emit(itemDo)
+		l.block++
+		return lexStmt
+	case "end":
+		l.emit(itemEnd)
+		l.block--
+		return lexStmt
+	case "while":
+		l.emit(itemWhile)
+		return lexExp
+	case "repeat":
+		l.emit(itemRepeat)
+		l.block++
+		return lexStmt
+	case "until":
+		l.emit(itemUntil)
+		l.block--
+		return lexExp
+	case "if":
+		l.emit(itemIf)
+		return lexExp
+	case "then":
+		l.emit(itemThen)
+		l.block++
+		return lexStmt
+	case "elseif":
+		l.block--
+		l.emit(itemElseIf)
+		return lexExp
+	case "else":
+		l.block--
+		l.emit(itemElse)
+		l.block++
+		return lexStmt
+	}
 }
 
 func lexSpace(l *lexer) stateFn {
@@ -386,6 +457,7 @@ func lexIdentifier(l *lexer) stateFn {
 			return lexComment
 		}
 	}
+	l.acceptWhitespace()
 	return lexIdentifier
 }
 
